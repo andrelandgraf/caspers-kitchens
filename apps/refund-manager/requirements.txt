@@ -1,6 +1,0 @@
-fastapi
-uvicorn[standard]
-sqlalchemy
-psycopg[binary]
-databricks-sdk
-databricks-sql-connector

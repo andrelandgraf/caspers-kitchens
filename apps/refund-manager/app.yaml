@@ -1,8 +1,0 @@
-command:
-  - uvicorn 
-  - app.main:app
-env:
-  - name: DATABRICKS_WAREHOUSE_ID
-    value: 'e1a2914f603fc607'
-  - name: DATABRICKS_CATALOG
-    value: 'cazzper'

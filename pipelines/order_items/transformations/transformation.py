@@ -59,22 +59,34 @@ def silver_order_items():
            .withColumn("item",       F.explode("body_obj.items"))
            .withColumn("extended_price", F.col("item.price") * F.col("item.qty"))
            .withColumn("order_day",  F.to_date("event_ts"))
-           .select(
-               "order_id",
-               "location_id",
-               F.col("event_ts").alias("order_ts"),               # canonical event time
-               "order_day",
-               F.col("item.id").alias("item_id"),
-               F.col("item.menu_id"),
-               F.col("item.category_id"),
-               F.col("item.brand_id"),
-               F.col("item.name").alias("item_name"),
-               F.col("item.price"),
-               F.col("item.qty"),
-               "extended_price"
-           )
     )
-    return df
+    # Support both canonical events (location_id) and legacy generator events (location/gk_id).
+    source_columns = set(df.columns)
+    if "location_id" in source_columns:
+        location_expr = F.col("location_id").cast("string")
+    elif "location" in source_columns:
+        location_expr = F.col("location")
+    elif "gk_id" in source_columns:
+        location_expr = F.col("gk_id")
+    else:
+        location_expr = F.lit(None).cast("string")
+
+    return (
+        df.select(
+            "order_id",
+            location_expr.alias("location_id"),
+            F.col("event_ts").alias("order_ts"),               # canonical event time
+            "order_day",
+            F.col("item.id").alias("item_id"),
+            F.col("item.menu_id"),
+            F.col("item.category_id"),
+            F.col("item.brand_id"),
+            F.col("item.name").alias("item_name"),
+            F.col("item.price"),
+            F.col("item.qty"),
+            "extended_price"
+        )
+    )
 
 # ──────────────────────────────────────────────────────────────
 # 2-A. Gold – order header (one row per order)
