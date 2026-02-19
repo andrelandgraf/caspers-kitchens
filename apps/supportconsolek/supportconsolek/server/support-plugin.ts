@@ -206,6 +206,16 @@ function extractErrorMessage(error: unknown): string {
   return String(error ?? "unknown_error");
 }
 
+function isServingPermissionError(error: unknown): boolean {
+  const message = extractErrorMessage(error).toLowerCase();
+  return (
+    message.includes("do not have permission")
+    || message.includes("permission denied")
+    || message.includes("not authorized")
+    || message.includes("unauthorized")
+  );
+}
+
 function isPermissionDeniedError(error: unknown): boolean {
   const message = extractErrorMessage(error).toLowerCase();
   return message.includes("permission denied") || message.includes("must be owner");
@@ -280,6 +290,34 @@ function createRegenerationPrompt(params: {
     "Recommendation objects must use keys {\"amount_usd\": number, \"reason\": string} or null.",
     `Case payload: ${JSON.stringify(baseContext)}`,
   ].join("\n");
+}
+
+function createFallbackRegeneratedReport(params: {
+  currentReport: Record<string, unknown> | null | undefined;
+  operatorContext: string | null | undefined;
+  supportRequestId: string;
+  userId: string | null | undefined;
+  orderId: string;
+}): Record<string, unknown> {
+  const report = parseAgentReport(params.currentReport ?? {});
+  const operatorContext = (params.operatorContext ?? "").trim();
+  const existingDraft = typeof report.draft_response === "string" ? report.draft_response.trim() : "";
+
+  if (operatorContext.length > 0) {
+    const contextLine = `Operator context: ${operatorContext}`;
+    report.draft_response = existingDraft.length > 0
+      ? `${existingDraft}\n\n${contextLine}`
+      : contextLine;
+  } else if (!existingDraft) {
+    report.draft_response = "Thanks for reaching out. We are reviewing your request and will follow up shortly.";
+  }
+
+  report.support_request_id = params.supportRequestId;
+  report.user_id = params.userId ?? "";
+  report.order_id = params.orderId;
+  report.regeneration_mode = "fallback_permission_denied";
+
+  return normalizeReportForUi(report, params.userId);
 }
 
 function deriveCaseStatus(params: {
@@ -954,9 +992,10 @@ export class SupportPlugin extends Plugin {
         currentReport: body.current_report ?? null,
       });
 
-      let servingResponse: unknown;
+      let normalized: Record<string, unknown>;
+      let warning: string | null = null;
       try {
-        servingResponse = await this.workspaceClient.apiClient.request({
+        const servingResponse = await this.workspaceClient.apiClient.request({
           path: "/serving-endpoints/responses",
           method: "POST",
           headers: new Headers({
@@ -969,21 +1008,24 @@ export class SupportPlugin extends Plugin {
             input: [{ role: "user", content: prompt }],
           },
         });
+        const responseText = extractResponseText(servingResponse);
+        const parsed = parseAgentReport(responseText);
+        normalized = normalizeReportForUi(parsed, body.user_id ?? null);
       } catch (error) {
-        const message = extractErrorMessage(error);
-        if (message.toLowerCase().includes("do not have permission")) {
-          res.status(403).json({
-            error: "serving_endpoint_permission_denied",
-            message: `App service principal cannot query endpoint '${this.supportAgentEndpoint}'. Grant CAN_QUERY permission on the serving endpoint to service principal '${process.env.DATABRICKS_CLIENT_ID ?? "app service principal"}'.`,
-          });
-          return;
+        if (!isServingPermissionError(error)) {
+          throw error;
         }
-        throw error;
-      }
 
-      const responseText = extractResponseText(servingResponse);
-      const parsed = parseAgentReport(responseText);
-      const normalized = normalizeReportForUi(parsed, body.user_id ?? null);
+        warning = `App service principal cannot query endpoint '${this.supportAgentEndpoint}'. Saved a fallback regeneration instead. Grant CAN_QUERY to service principal '${process.env.DATABRICKS_CLIENT_ID ?? "app service principal"}' for model-based regeneration.`;
+        console.warn("[support] regenerate fallback:", warning);
+        normalized = createFallbackRegeneratedReport({
+          currentReport: body.current_report ?? null,
+          operatorContext: body.operator_context ?? null,
+          supportRequestId: body.support_request_id,
+          userId: body.user_id ?? null,
+          orderId: body.order_id,
+        });
+      }
 
       await this.pool.query(
         `INSERT INTO support.operator_regenerated_reports
@@ -1009,7 +1051,7 @@ export class SupportPlugin extends Plugin {
         [body.support_request_id],
       );
 
-      res.status(201).json({ report: normalized });
+      res.status(201).json({ report: normalized, warning });
     }));
   }
 

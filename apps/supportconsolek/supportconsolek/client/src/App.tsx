@@ -389,9 +389,12 @@ function App() {
       if (!res.ok) {
         throw new Error(await parseErrorMessage(res));
       }
+      const body = (await res.json()) as { warning?: string };
       showNotice({
         kind: "success",
-        message: "Report regenerated with operator context.",
+        message: body.warning
+          ? `Report regenerated with fallback. ${body.warning}`
+          : "Report regenerated with operator context.",
         supportRequestId: selected.support_request_id,
       });
       await openDetails(selected.support_request_id, { showLoading: false, preserveScroll: true });
