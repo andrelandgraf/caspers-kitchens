@@ -162,3 +162,27 @@ targets:
                 - task_key: Support_Request_Agent_Stream
               notebook_task:
                 notebook_path: ${workspace.root_path}/stages/support_lakebase
+        support_response_evals_hourly:
+          name: "Support Response Evals Hourly"
+          queue:
+            enabled: true
+          performance_target: PERFORMANCE_OPTIMIZED
+          parameters:
+            - name: CATALOG
+              default: casperskitchens
+            - name: JUDGE_MODEL
+              default: databricks-gpt-5-mini
+            - name: EVAL_LIMIT
+              default: "100"
+          schedule:
+            quartz_cron_expression: "0 0 * * * ?"
+            timezone_id: "UTC"
+            pause_status: "UNPAUSED"
+          tasks:
+            - task_key: run_support_response_evals
+              notebook_task:
+                notebook_path: ${workspace.root_path}/demos/agent-compare-models/demo_materials/support-response-evals
+                base_parameters:
+                  CATALOG: "{{job.parameters.CATALOG}}"
+                  JUDGE_MODEL: "{{job.parameters.JUDGE_MODEL}}"
+                  EVAL_LIMIT: "{{job.parameters.EVAL_LIMIT}}"

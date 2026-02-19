@@ -28,6 +28,7 @@ import {
   SheetTitle,
   Textarea,
 } from "@databricks/appkit-ui/react";
+import { Toaster, toast } from "sonner";
 
 type Summary = { requests: number; actions: number; replies: number };
 
@@ -75,12 +76,22 @@ type RegenerationItem = {
   report: Report;
 };
 
+type ResponseRating = {
+  rating_id: number;
+  rating: "thumbs_up" | "thumbs_down";
+  reason_code?: string | null;
+  feedback_notes?: string | null;
+  actor?: string | null;
+  created_at: string;
+};
+
 type RequestItem = {
   support_request_id: string;
   user_id: string;
   user_display_name?: string | null;
   order_id: string;
   ts: string;
+  request_text?: string | null;
   report: Report;
   case_state?: CaseState;
 };
@@ -88,6 +99,8 @@ type RequestItem = {
 type RequestDetails = RequestItem & {
   actions: Array<Record<string, unknown>>;
   replies: Array<Record<string, unknown>>;
+  ratings?: ResponseRating[];
+  latest_rating?: ResponseRating | null;
   regenerations?: RegenerationItem[];
   timeline?: TimelineEvent[];
 };
@@ -97,6 +110,17 @@ type NoticeState = {
   message: string;
   supportRequestId?: string;
 } | null;
+
+const RATING_REASON_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: "incorrect_facts", label: "Incorrect facts in response" },
+  { value: "wrong_refund_amount", label: "Wrong refund amount" },
+  { value: "wrong_credit_amount", label: "Wrong credit amount" },
+  { value: "should_escalate", label: "Should have escalated" },
+  { value: "should_not_escalate", label: "Should not have escalated" },
+  { value: "poor_tone", label: "Poor tone or wording" },
+  { value: "unclear_response", label: "Unclear or incomplete response" },
+  { value: "other", label: "Other" },
+];
 
 function App() {
   const PAGE_SIZE = 50;
@@ -110,10 +134,13 @@ function App() {
   const [actor, setActor] = useState("");
   const [refundAmount, setRefundAmount] = useState("");
   const [creditAmount, setCreditAmount] = useState("");
+  const [ratingChoice, setRatingChoice] = useState<"thumbs_up" | "thumbs_down">("thumbs_up");
+  const [ratingReason, setRatingReason] = useState("");
+  const [ratingNotes, setRatingNotes] = useState("");
   const [loading, setLoading] = useState(false);
   const [detailsLoading, setDetailsLoading] = useState(false);
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
-  const [pendingAction, setPendingAction] = useState<"apply_refund" | "apply_credit" | "send_reply" | "regenerate" | null>(null);
+  const [pendingAction, setPendingAction] = useState<"apply_refund" | "apply_credit" | "send_reply" | "regenerate" | "rate_response" | null>(null);
   const [notice, setNotice] = useState<NoticeState>(null);
   const [error, setError] = useState<string | null>(null);
   const drawerScrollRef = useRef<HTMLDivElement | null>(null);
@@ -161,18 +188,15 @@ function App() {
   const suggestedRefund = selected?.report?.refund_recommendation?.amount_usd ?? null;
   const suggestedCredit = selected?.report?.credit_recommendation?.amount_usd ?? null;
   const selectedCaseState = selected?.case_state;
+  const latestRating = selected?.latest_rating;
+  const latestRatingLabel = latestRating?.rating === "thumbs_up"
+    ? "Agent Rating: Thumbs Up"
+    : latestRating?.rating === "thumbs_down"
+      ? "Agent Rating: Thumbs Down"
+      : "Agent Rating: Not rated";
 
   const appliedRefund = selected?.actions.find((a) => a.action_type === "apply_refund");
   const appliedCredit = selected?.actions.find((a) => a.action_type === "apply_credit");
-
-  const toNumber = (value: unknown): number | null => {
-    if (typeof value === "number" && Number.isFinite(value)) return value;
-    if (typeof value === "string") {
-      const parsed = Number(value);
-      if (Number.isFinite(parsed)) return parsed;
-    }
-    return null;
-  };
 
   const parseErrorMessage = async (res: Response): Promise<string> => {
     try {
@@ -180,6 +204,15 @@ function App() {
       return body.message || body.error || `Request failed (${res.status})`;
     } catch {
       return `Request failed (${res.status})`;
+    }
+  };
+
+  const showNotice = (nextNotice: Exclude<NoticeState, null>) => {
+    setNotice(nextNotice);
+    if (nextNotice.kind === "success") {
+      toast.success(nextNotice.message);
+    } else {
+      toast.error(nextNotice.message);
     }
   };
 
@@ -237,6 +270,9 @@ function App() {
           ? String(json.report.credit_recommendation.amount_usd)
           : "",
       );
+      setRatingChoice(json?.latest_rating?.rating === "thumbs_down" ? "thumbs_down" : "thumbs_up");
+      setRatingReason(json?.latest_rating?.reason_code ?? "");
+      setRatingNotes(json?.latest_rating?.feedback_notes ?? "");
       setError(null);
       if (preserveScroll) {
         requestAnimationFrame(() => {
@@ -280,7 +316,7 @@ function App() {
       if (!res.ok) {
         throw new Error(await parseErrorMessage(res));
       }
-      setNotice({
+      showNotice({
         kind: "success",
         message: actionType === "apply_credit" ? "Credits applied successfully." : "Refund applied successfully.",
         supportRequestId: selected.support_request_id,
@@ -288,7 +324,7 @@ function App() {
       await openDetails(selected.support_request_id, { showLoading: false, preserveScroll: true });
       await refresh();
     } catch (e) {
-      setNotice({
+      showNotice({
         kind: "error",
         message: e instanceof Error ? e.message : String(e),
       });
@@ -316,7 +352,7 @@ function App() {
       if (!res.ok) {
         throw new Error(await parseErrorMessage(res));
       }
-      setNotice({
+      showNotice({
         kind: "success",
         message: "Reply sent successfully.",
         supportRequestId: selected.support_request_id,
@@ -324,7 +360,7 @@ function App() {
       await openDetails(selected.support_request_id, { showLoading: false, preserveScroll: true });
       await refresh();
     } catch (e) {
-      setNotice({
+      showNotice({
         kind: "error",
         message: e instanceof Error ? e.message : String(e),
       });
@@ -353,7 +389,7 @@ function App() {
       if (!res.ok) {
         throw new Error(await parseErrorMessage(res));
       }
-      setNotice({
+      showNotice({
         kind: "success",
         message: "Report regenerated with operator context.",
         supportRequestId: selected.support_request_id,
@@ -361,7 +397,45 @@ function App() {
       await openDetails(selected.support_request_id, { showLoading: false, preserveScroll: true });
       await refresh();
     } catch (e) {
-      setNotice({
+      showNotice({
+        kind: "error",
+        message: e instanceof Error ? e.message : String(e),
+      });
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const submitRating = async () => {
+    if (!selected) return;
+    setPendingAction("rate_response");
+    setNotice(null);
+    try {
+      const res = await fetch("/api/support/ratings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          support_request_id: selected.support_request_id,
+          order_id: selected.order_id,
+          user_id: selected.user_id,
+          rating: ratingChoice,
+          reason_code: ratingReason || null,
+          feedback_notes: ratingNotes || null,
+          actor: actor || null,
+        }),
+      });
+      if (!res.ok) {
+        throw new Error(await parseErrorMessage(res));
+      }
+      showNotice({
+        kind: "success",
+        message: "Agent response rating saved.",
+        supportRequestId: selected.support_request_id,
+      });
+      await openDetails(selected.support_request_id, { showLoading: false, preserveScroll: true });
+      await refresh();
+    } catch (e) {
+      showNotice({
         kind: "error",
         message: e instanceof Error ? e.message : String(e),
       });
@@ -372,6 +446,7 @@ function App() {
 
   return (
     <div className="min-h-screen bg-background p-6 w-full">
+      <Toaster position="bottom-left" richColors />
       <div className="mb-8 flex items-center justify-between">
         <div>
           <h1 className="text-3xl font-bold tracking-tight">Support Console</h1>
@@ -561,19 +636,16 @@ function App() {
                   </div>
                 </div>
                 <div className="rounded-xl border bg-muted/35 p-5 space-y-3">
-                  <div className="text-lg font-semibold">Case State</div>
+                  <div className="text-lg font-semibold">History</div>
                   <div className="flex flex-wrap gap-2">
+                    <Badge variant={statusVariant(selectedCaseState?.case_status)}>
+                      Current Status: {statusLabel(selectedCaseState?.case_status)}
+                    </Badge>
                     <Badge variant="outline">Next: {nextActionLabel(selectedCaseState?.next_action)}</Badge>
                     <Badge variant="secondary">Last Action: {selectedCaseState?.last_action_type ?? "none"}</Badge>
-                    <Badge variant="secondary">Report: {selectedCaseState?.latest_report_source ?? "sync"}</Badge>
-                    <Badge variant="secondary">Replies: {selectedCaseState?.reply_count ?? 0}</Badge>
-                    <Badge variant="secondary">Actions: {selectedCaseState?.action_count ?? 0}</Badge>
-                    <Badge variant="secondary">Re-gens: {selectedCaseState?.regen_count ?? 0}</Badge>
+                    <Badge variant="secondary">{latestRatingLabel}</Badge>
                   </div>
-                </div>
-                <div className="rounded-xl border bg-muted/35 p-5 space-y-3">
-                  <div className="text-lg font-semibold">Timeline</div>
-                  <div className="space-y-2 max-h-52 overflow-y-auto pr-1">
+                  <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
                     {(selected.timeline ?? []).slice(0, 8).map((event, idx) => (
                       <div key={`${event.event_type}-${event.event_at}-${idx}`} className="text-sm rounded-md border bg-background/70 p-2">
                         <div className="font-medium">{event.event_type.replaceAll("_", " ")}</div>
@@ -587,128 +659,23 @@ function App() {
                     )}
                   </div>
                 </div>
-                <div className="rounded-xl border bg-muted/35 p-5 space-y-2">
-                  <div className="text-lg font-semibold">Past Interactions Summary</div>
-                  <div className="text-sm whitespace-pre-wrap leading-6">
-                    {selected.report?.past_interactions_summary}
-                  </div>
-                </div>
-                <div className="rounded-xl border bg-muted/35 p-5 space-y-2">
-                  <div className="text-lg font-semibold">Order Details Summary</div>
-                  <div className="text-sm whitespace-pre-wrap leading-6">
-                    {selected.report?.order_details_summary}
-                  </div>
-                </div>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <Card className="bg-muted/25">
-                    <CardHeader className="pb-2">
-                      <CardTitle className="text-base">Refund Recommendation</CardTitle>
-                    </CardHeader>
-                    <CardContent className="text-lg font-medium">
-                      {formatCurrency(selected.report?.refund_recommendation?.amount_usd)}
-                    </CardContent>
-                  </Card>
-                  <Card className="bg-muted/25">
-                    <CardHeader className="pb-2">
-                      <CardTitle className="text-base">Credit Recommendation</CardTitle>
-                    </CardHeader>
-                    <CardContent className="text-lg font-medium">
-                      {formatCurrency(selected.report?.credit_recommendation?.amount_usd)}
-                    </CardContent>
-                  </Card>
-                </div>
-                <div className="rounded-xl border bg-muted/35 p-4">
-                  <div className="flex flex-wrap gap-2">
-                    {appliedRefund ? (
-                      <Badge variant="secondary">
-                        Refund Applied: {formatCurrency(toNumber(appliedRefund.amount_usd))}
-                      </Badge>
-                    ) : (
-                      <Badge variant="secondary">Refund not applied</Badge>
-                    )}
-                    {appliedCredit ? (
-                      <Badge variant="secondary">
-                        Credits Applied: {formatCurrency(toNumber(appliedCredit.amount_usd))}
-                      </Badge>
-                    ) : (
-                      <Badge variant="secondary">Credits not applied</Badge>
-                    )}
-                  </div>
-                </div>
+
                 <div className="rounded-xl border bg-muted/35 p-5 space-y-3">
-                  <div className="text-lg font-semibold">Replies</div>
-                  <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
-                    {selected.replies.length === 0 && (
-                      <div className="text-sm text-muted-foreground">No replies sent yet.</div>
-                    )}
-                    {selected.replies.map((reply, idx) => (
-                      <div key={`reply-${idx}`} className="rounded-md border bg-background/70 p-3">
-                        <div className="text-xs text-muted-foreground">
-                          {formatTs(String(reply.created_at ?? ""))}
-                          {reply.sent_by ? ` · ${String(reply.sent_by)}` : ""}
-                        </div>
-                        <div className="text-sm mt-1 whitespace-pre-wrap">
-                          {String(reply.message_text ?? "")}
-                        </div>
-                      </div>
-                    ))}
+                  <div className="text-lg font-semibold">Support Request & Actions</div>
+                  <div className="space-y-1">
+                    <div className="text-sm font-medium">Raw Support Message</div>
+                    <div className="rounded-md border bg-background/70 p-3 text-sm whitespace-pre-wrap leading-6">
+                      {selected.request_text || "Raw support message not available for this request yet."}
+                    </div>
                   </div>
-                </div>
-                <div className="rounded-xl border bg-muted/35 p-5 space-y-3">
-                  <div className="text-lg font-semibold">Regeneration History</div>
-                  <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
-                    {(selected.regenerations ?? []).length === 0 && (
-                      <div className="text-sm text-muted-foreground">No regenerated reports yet.</div>
-                    )}
-                    {(selected.regenerations ?? []).map((regen) => (
-                      <div
-                        key={`regen-${regen.regenerated_report_id}`}
-                        className="rounded-md border bg-background/70 p-3 space-y-1"
-                      >
-                        <div className="text-xs text-muted-foreground">
-                          {formatTs(regen.created_at)}{regen.actor ? ` · ${regen.actor}` : ""}
-                        </div>
-                        <div className="text-sm text-muted-foreground">
-                          {regen.operator_context || "No operator context provided."}
-                        </div>
-                      </div>
-                    ))}
+                  <div className="space-y-1">
+                    <div className="text-sm font-medium">Suggested Agent Response</div>
+                    <Textarea
+                      className="min-h-[120px]"
+                      value={replyText}
+                      onChange={(e) => setReplyText(e.target.value)}
+                    />
                   </div>
-                </div>
-                <div className="rounded-xl border bg-muted/35 p-5 space-y-3">
-                  <div className="text-lg font-semibold">Reply Draft</div>
-                  <Textarea
-                    className="min-h-[120px]"
-                    value={replyText}
-                    onChange={(e) => setReplyText(e.target.value)}
-                  />
-                </div>
-                <div className="rounded-xl border bg-muted/35 p-5 space-y-3">
-                  <div className="text-lg font-semibold">Operator Context for Re-Gen</div>
-                  <Textarea
-                    className="min-h-[96px]"
-                    value={operatorContext}
-                    onChange={(e) => setOperatorContext(e.target.value)}
-                    placeholder="Add extra context or constraints before regenerating this report..."
-                  />
-                  <div className="text-xs text-muted-foreground">
-                    Re-generation calls the model endpoint and can take up to ~30 seconds.
-                  </div>
-                  <div>
-                    <Button onClick={() => void regenerateReport()} disabled={detailsLoading || pendingAction !== null}>
-                      {pendingAction === "regenerate" ? (
-                        <span className="inline-flex items-center">
-                          <span className="mr-2 inline-block h-3 w-3 animate-spin rounded-full border-2 border-current border-t-transparent" />
-                          Regenerating...
-                        </span>
-                      ) : (
-                        "Re-Generate Report"
-                      )}
-                    </Button>
-                  </div>
-                </div>
-                <div className="rounded-xl border bg-muted/35 p-5 space-y-3">
-                  <div className="text-lg font-semibold">Actions</div>
                   <div className="grid grid-cols-2 gap-2">
                     <Input value={actor} placeholder="Operator" onChange={(e) => setActor(e.target.value)} />
                     <div className="w-fit">
@@ -773,6 +740,103 @@ function App() {
                         )}
                       </Button>
                     </div>
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    Suggested refund: {formatCurrency(selected.report?.refund_recommendation?.amount_usd)} · Suggested credit: {formatCurrency(selected.report?.credit_recommendation?.amount_usd)}
+                  </div>
+                </div>
+
+                <div className="rounded-xl border bg-muted/35 p-5 space-y-3">
+                  <div className="text-lg font-semibold">Re-Generate Agent</div>
+                  <Textarea
+                    className="min-h-[96px]"
+                    value={operatorContext}
+                    onChange={(e) => setOperatorContext(e.target.value)}
+                    placeholder="Add extra context or constraints before regenerating this report..."
+                  />
+                  <div className="text-xs text-muted-foreground">
+                    Re-generation calls the model endpoint and can take up to ~30 seconds.
+                  </div>
+                  <div>
+                    <Button onClick={() => void regenerateReport()} disabled={detailsLoading || pendingAction !== null}>
+                      {pendingAction === "regenerate" ? (
+                        <span className="inline-flex items-center">
+                          <span className="mr-2 inline-block h-3 w-3 animate-spin rounded-full border-2 border-current border-t-transparent" />
+                          Regenerating...
+                        </span>
+                      ) : (
+                        "Re-Generate Report"
+                      )}
+                    </Button>
+                  </div>
+                </div>
+
+                <div className="rounded-xl border bg-muted/35 p-5 space-y-3">
+                  <div className="text-lg font-semibold">Rate Agent</div>
+                  <div className="rounded-md border bg-background/70 p-3 space-y-1 text-sm">
+                    <div className="font-medium">Agent Draft</div>
+                    <div className="whitespace-pre-wrap">{selected.report?.draft_response || "No draft response"}</div>
+                    <div className="text-xs text-muted-foreground">
+                      Refund: {formatCurrency(selected.report?.refund_recommendation?.amount_usd)} · Credit: {formatCurrency(selected.report?.credit_recommendation?.amount_usd)}
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2 items-center">
+                    <div className="flex gap-2">
+                      <Button
+                        variant={ratingChoice === "thumbs_up" ? "default" : "secondary"}
+                        onClick={() => setRatingChoice("thumbs_up")}
+                        disabled={detailsLoading || pendingAction !== null}
+                      >
+                        Thumbs Up
+                      </Button>
+                      <Button
+                        variant={ratingChoice === "thumbs_down" ? "default" : "secondary"}
+                        onClick={() => setRatingChoice("thumbs_down")}
+                        disabled={detailsLoading || pendingAction !== null}
+                      >
+                        Thumbs Down
+                      </Button>
+                    </div>
+                    <select
+                      value={ratingReason}
+                      onChange={(e) => setRatingReason(e.target.value)}
+                      disabled={detailsLoading || pendingAction !== null}
+                      className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                    >
+                      <option value="">
+                        {ratingChoice === "thumbs_down" ? "Select reason code" : "Optional reason code"}
+                      </option>
+                      {RATING_REASON_OPTIONS.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <Textarea
+                    className="min-h-[84px]"
+                    value={ratingNotes}
+                    onChange={(e) => setRatingNotes(e.target.value)}
+                    placeholder="Optional notes for this rating..."
+                    disabled={detailsLoading || pendingAction !== null}
+                  />
+                  {latestRating && (
+                    <div className="text-xs text-muted-foreground">
+                      Last rating: {latestRating.rating === "thumbs_up" ? "thumbs up" : "thumbs down"} at {formatTs(latestRating.created_at)}
+                      {latestRating.actor ? ` by ${latestRating.actor}` : ""}
+                    </div>
+                  )}
+                  <div>
+                    <Button onClick={() => void submitRating()} disabled={detailsLoading || pendingAction !== null}>
+                      {pendingAction === "rate_response" ? (
+                        <span className="inline-flex items-center">
+                          <span className="mr-2 inline-block h-3 w-3 animate-spin rounded-full border-2 border-current border-t-transparent" />
+                          Saving...
+                        </span>
+                      ) : (
+                        "Save Rating"
+                      )}
+                    </Button>
                   </div>
                 </div>
               </>

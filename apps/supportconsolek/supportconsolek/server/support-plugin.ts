@@ -33,6 +33,16 @@ interface RegenerateBody {
   current_report?: Record<string, unknown> | null;
 }
 
+interface RatingBody {
+  support_request_id: string;
+  order_id: string;
+  user_id?: string | null;
+  rating: "thumbs_up" | "thumbs_down";
+  reason_code?: string | null;
+  feedback_notes?: string | null;
+  actor?: string | null;
+}
+
 type CaseStatus = "pending" | "in_progress" | "done" | "blocked";
 
 const DEFAULT_REPORT = {
@@ -191,6 +201,54 @@ function extractResponseText(response: unknown): string {
   throw new Error("Serving response text not found");
 }
 
+function extractErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return String(error ?? "unknown_error");
+}
+
+function isPermissionDeniedError(error: unknown): boolean {
+  const message = extractErrorMessage(error).toLowerCase();
+  return message.includes("permission denied") || message.includes("must be owner");
+}
+
+async function fetchSupportRequestText(pool: Pool, supportRequestId: string): Promise<string | null> {
+  const tableCandidates = [
+    "support.support_agent_reports_sync",
+    "support.raw_support_requests_sync",
+    "support.raw_support_requests",
+  ];
+
+  for (const tableName of tableCandidates) {
+    try {
+      const result = await pool.query(
+        `SELECT request_text
+         FROM ${tableName}
+         WHERE support_request_id = $1
+         ORDER BY ts DESC
+         LIMIT 1`,
+        [supportRequestId],
+      );
+      const value = result.rows[0]?.request_text;
+      if (typeof value === "string" && value.trim().length > 0) {
+        return value;
+      }
+    } catch (error) {
+      const message = extractErrorMessage(error).toLowerCase();
+      if (
+        message.includes("does not exist")
+        || message.includes("undefined table")
+        || message.includes("undefined column")
+        || message.includes("permission denied")
+      ) {
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  return null;
+}
+
 function createRegenerationPrompt(params: {
   supportRequestId: string;
   userId: string | null | undefined;
@@ -222,13 +280,6 @@ function createRegenerationPrompt(params: {
     "Recommendation objects must use keys {\"amount_usd\": number, \"reason\": string} or null.",
     `Case payload: ${JSON.stringify(baseContext)}`,
   ].join("\n");
-}
-
-function extractErrorMessage(error: unknown): string {
-  if (error instanceof Error) {
-    return error.message;
-  }
-  return String(error);
 }
 
 function deriveCaseStatus(params: {
@@ -314,6 +365,24 @@ export class SupportPlugin extends Plugin {
            last_action TEXT,
            notes TEXT
          )`,
+      );
+      await this.pool.query(
+        `CREATE TABLE IF NOT EXISTS support.response_ratings (
+           rating_id BIGSERIAL PRIMARY KEY,
+           support_request_id TEXT NOT NULL,
+           order_id TEXT NOT NULL,
+           user_id TEXT,
+           rating TEXT NOT NULL CHECK (rating IN ('thumbs_up', 'thumbs_down')),
+           reason_code TEXT,
+           feedback_notes TEXT,
+           actor TEXT,
+           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+           UNIQUE (support_request_id)
+         )`,
+      );
+      await this.pool.query(
+        `CREATE UNIQUE INDEX IF NOT EXISTS response_ratings_support_request_id_uq
+         ON support.response_ratings (support_request_id)`,
       );
     } catch (error) {
       this.setupError = error instanceof Error ? error.message : String(error);
@@ -559,6 +628,24 @@ export class SupportPlugin extends Plugin {
         return;
       }
 
+      let ratingsRows: Array<Record<string, unknown>> = [];
+      try {
+        const ratingsResult = await this.pool.query(
+          `SELECT rating_id, rating, reason_code, feedback_notes, actor, created_at
+           FROM support.response_ratings
+           WHERE support_request_id = $1
+           ORDER BY created_at DESC`,
+          [sid],
+        );
+        ratingsRows = ratingsResult.rows;
+      } catch (error) {
+        if (isPermissionDeniedError(error)) {
+          console.warn("[support] ratings unavailable for this principal:", extractErrorMessage(error));
+        } else {
+          throw error;
+        }
+      }
+
       const [actions, replies, regenerations, statusRow] = await Promise.all([
         this.pool.query(
           `SELECT action_id, action_type, amount_usd, payload, status, actor, created_at
@@ -591,6 +678,7 @@ export class SupportPlugin extends Plugin {
       ]);
 
       const row = request.rows[0];
+      const requestText = await fetchSupportRequestText(this.pool, sid);
       const hasRefund = actions.rows.some((a) => a.action_type === "apply_refund");
       const hasCredit = actions.rows.some((a) => a.action_type === "apply_credit");
       const hasReply = replies.rows.length > 0 || actions.rows.some((a) => a.action_type === "send_reply");
@@ -627,6 +715,15 @@ export class SupportPlugin extends Plugin {
             status: ac.status ?? null,
           },
         })),
+        ...ratingsRows.map((rt) => ({
+          event_type: "response_rated",
+          event_at: rt.created_at as string,
+          actor: (rt.actor as string | null) ?? null,
+          details: {
+            rating: rt.rating as string,
+            reason_code: (rt.reason_code as string | null) ?? null,
+          },
+        })),
       ].sort(
         (a, b) =>
           new Date(String(b.event_at)).getTime() - new Date(String(a.event_at)).getTime(),
@@ -638,9 +735,12 @@ export class SupportPlugin extends Plugin {
         user_display_name: fakeDisplayName(row.user_id),
         order_id: row.order_id,
         ts: row.ts,
+        request_text: requestText,
         report: normalizeReportForUi(parseAgentReport(row.agent_response), row.user_id),
         actions: actions.rows,
         replies: replies.rows,
+        ratings: ratingsRows,
+        latest_rating: ratingsRows[0] ?? null,
         regenerations: regenerations.rows.map((rr) => ({
           regenerated_report_id: rr.regenerated_report_id,
           operator_context: rr.operator_context,
@@ -773,6 +873,62 @@ export class SupportPlugin extends Plugin {
              last_action = EXCLUDED.last_action`,
         [body.support_request_id],
       );
+
+      res.status(201).json(inserted.rows[0]);
+    }));
+
+    router.post("/ratings", withJsonError(async (req, res) => {
+      if (!this.pool) {
+        res
+          .status(503)
+          .json({ error: "DB not ready", message: this.setupError });
+        return;
+      }
+      const body = req.body as RatingBody;
+      if (!body?.support_request_id || !body?.order_id || !body?.rating) {
+        res.status(400).json({ error: "Invalid payload" });
+        return;
+      }
+      if (body.rating !== "thumbs_up" && body.rating !== "thumbs_down") {
+        res.status(400).json({ error: "Invalid rating value" });
+        return;
+      }
+
+      let inserted;
+      try {
+        inserted = await this.pool.query(
+          `INSERT INTO support.response_ratings
+             (support_request_id, order_id, user_id, rating, reason_code, feedback_notes, actor)
+           VALUES ($1,$2,$3,$4,$5,$6,$7)
+           ON CONFLICT (support_request_id) DO UPDATE
+           SET order_id = EXCLUDED.order_id,
+               user_id = EXCLUDED.user_id,
+               rating = EXCLUDED.rating,
+               reason_code = EXCLUDED.reason_code,
+               feedback_notes = EXCLUDED.feedback_notes,
+               actor = EXCLUDED.actor,
+               created_at = NOW()
+           RETURNING rating_id, rating, reason_code, feedback_notes, actor, created_at`,
+          [
+            body.support_request_id,
+            body.order_id,
+            body.user_id ?? null,
+            body.rating,
+            body.reason_code ?? null,
+            body.feedback_notes ?? null,
+            body.actor ?? null,
+          ],
+        );
+      } catch (error) {
+        if (isPermissionDeniedError(error)) {
+          res.status(403).json({
+            error: "ratings_permission_denied",
+            message: "App principal lacks permission on support.response_ratings. Grant table privileges in Lakebase.",
+          });
+          return;
+        }
+        throw error;
+      }
 
       res.status(201).json(inserted.rows[0]);
     }));
