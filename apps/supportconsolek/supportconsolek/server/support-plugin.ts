@@ -12,7 +12,6 @@ interface ActionBody {
   user_id?: string | null;
   action_type: "apply_refund" | "apply_credit";
   amount_usd: number;
-  actor?: string | null;
   payload?: Json;
 }
 
@@ -21,7 +20,6 @@ interface ReplyBody {
   order_id: string;
   user_id?: string | null;
   message_text: string;
-  sent_by?: string | null;
 }
 
 interface RegenerateBody {
@@ -29,7 +27,6 @@ interface RegenerateBody {
   user_id?: string | null;
   order_id: string;
   operator_context?: string | null;
-  actor?: string | null;
   current_report?: Record<string, unknown> | null;
 }
 
@@ -40,7 +37,6 @@ interface RatingBody {
   rating: "thumbs_up" | "thumbs_down";
   reason_code?: string | null;
   feedback_notes?: string | null;
-  actor?: string | null;
 }
 
 type CaseStatus = "pending" | "in_progress" | "done" | "blocked";
@@ -219,6 +215,57 @@ function isServingPermissionError(error: unknown): boolean {
 function isPermissionDeniedError(error: unknown): boolean {
   const message = extractErrorMessage(error).toLowerCase();
   return message.includes("permission denied") || message.includes("must be owner");
+}
+
+function firstHeaderValue(value: unknown): string | null {
+  if (typeof value === "string" && value.trim().length > 0) {
+    return value.trim();
+  }
+  if (Array.isArray(value)) {
+    const first = value.find((candidate) => typeof candidate === "string" && candidate.trim().length > 0);
+    if (typeof first === "string") {
+      return first.trim();
+    }
+  }
+  return null;
+}
+
+function extractCandidateUserId(forwardedUser: string): string {
+  const trimmed = forwardedUser.trim();
+  if (trimmed.includes("@")) {
+    return trimmed.split("@")[0] ?? trimmed;
+  }
+  return trimmed;
+}
+
+function extractNameFromScimUser(user: unknown): string | null {
+  if (!user || typeof user !== "object") {
+    return null;
+  }
+
+  const record = user as Record<string, unknown>;
+  const displayName = record.displayName;
+  if (typeof displayName === "string" && displayName.trim().length > 0) {
+    return displayName.trim();
+  }
+
+  const userName = record.userName;
+  if (typeof userName === "string" && userName.trim().length > 0) {
+    return userName.trim();
+  }
+
+  const name = record.name;
+  if (name && typeof name === "object") {
+    const nameRecord = name as Record<string, unknown>;
+    const givenName = typeof nameRecord.givenName === "string" ? nameRecord.givenName.trim() : "";
+    const familyName = typeof nameRecord.familyName === "string" ? nameRecord.familyName.trim() : "";
+    const combined = `${givenName} ${familyName}`.trim();
+    if (combined.length > 0) {
+      return combined;
+    }
+  }
+
+  return null;
 }
 
 async function fetchSupportRequestText(pool: Pool, supportRequestId: string): Promise<string | null> {
@@ -448,6 +495,76 @@ export class SupportPlugin extends Plugin {
       this.setupError = error instanceof Error ? error.message : String(error);
       console.error("[support] setup failed:", this.setupError);
     }
+  }
+
+  private async resolveOperatorFromClient(client: WorkspaceClient): Promise<string> {
+    const me = await client.currentUser.me();
+    const displayName = typeof me.displayName === "string" ? me.displayName.trim() : "";
+    if (displayName.length > 0) {
+      return displayName;
+    }
+    const userName = typeof me.userName === "string" ? me.userName.trim() : "";
+    if (userName.length > 0) {
+      return userName;
+    }
+    throw new Error("Could not determine authenticated Databricks user name");
+  }
+
+  private async resolveOperatorFromForwardedUser(forwardedUser: string): Promise<string | null> {
+    if (!this.workspaceClient) {
+      return null;
+    }
+
+    const candidateUserId = extractCandidateUserId(forwardedUser);
+    try {
+      const userResponse = await this.workspaceClient.apiClient.request({
+        path: `/api/2.0/preview/scim/v2/Users/${encodeURIComponent(candidateUserId)}`,
+        method: "GET",
+        headers: new Headers({
+          Accept: "application/scim+json, application/json",
+        }),
+        raw: false,
+      });
+      return extractNameFromScimUser(userResponse);
+    } catch (error) {
+      console.warn(
+        "[support] failed to resolve forwarded user name from SCIM:",
+        extractErrorMessage(error),
+      );
+      return null;
+    }
+  }
+
+  private async resolveAuthenticatedOperator(req: any): Promise<string> {
+    const forwardedAccessToken = firstHeaderValue(req.headers["x-forwarded-access-token"]);
+    const host = process.env.DATABRICKS_HOST;
+
+    try {
+      if (forwardedAccessToken && host) {
+        const userClient = new WorkspaceClient({
+          host,
+          token: forwardedAccessToken,
+          authType: "pat",
+        });
+        return this.resolveOperatorFromClient(userClient);
+      }
+    } catch (error) {
+      console.warn("[support] failed to resolve operator via forwarded token:", extractErrorMessage(error));
+    }
+
+    if (process.env.NODE_ENV === "development" && this.workspaceClient) {
+      return this.resolveOperatorFromClient(this.workspaceClient);
+    }
+
+    const fallbackUserId = firstHeaderValue(req.headers["x-forwarded-user"]);
+    if (fallbackUserId) {
+      const resolvedName = await this.resolveOperatorFromForwardedUser(fallbackUserId);
+      if (resolvedName) {
+        return resolvedName;
+      }
+    }
+
+    return "Support Staff";
   }
 
   injectRoutes(router: IAppRouter): void {
@@ -850,6 +967,7 @@ export class SupportPlugin extends Plugin {
         res.status(400).json({ error: "Invalid payload" });
         return;
       }
+      const operator = await this.resolveAuthenticatedOperator(req);
 
       const inserted = await this.pool.query(
         `INSERT INTO support.operator_actions
@@ -863,7 +981,7 @@ export class SupportPlugin extends Plugin {
           body.action_type,
           body.amount_usd,
           JSON.stringify(body.payload ?? {}),
-          body.actor ?? null,
+          operator,
         ],
       );
 
@@ -896,6 +1014,7 @@ export class SupportPlugin extends Plugin {
         res.status(400).json({ error: "Invalid payload" });
         return;
       }
+      const operator = await this.resolveAuthenticatedOperator(req);
 
       const inserted = await this.pool.query(
         `INSERT INTO support.support_replies
@@ -907,7 +1026,7 @@ export class SupportPlugin extends Plugin {
           body.order_id,
           body.user_id ?? null,
           body.message_text,
-          body.sent_by ?? null,
+          operator,
         ],
       );
 
@@ -920,7 +1039,7 @@ export class SupportPlugin extends Plugin {
           body.order_id,
           body.user_id ?? null,
           JSON.stringify({ message_text: body.message_text }),
-          body.sent_by ?? null,
+          operator,
         ],
       );
 
@@ -953,6 +1072,7 @@ export class SupportPlugin extends Plugin {
         res.status(400).json({ error: "Invalid rating value" });
         return;
       }
+      const operator = await this.resolveAuthenticatedOperator(req);
 
       let inserted;
       try {
@@ -976,7 +1096,7 @@ export class SupportPlugin extends Plugin {
             body.rating,
             body.reason_code ?? null,
             body.feedback_notes ?? null,
-            body.actor ?? null,
+            operator,
           ],
         );
       } catch (error) {
@@ -1005,6 +1125,7 @@ export class SupportPlugin extends Plugin {
         res.status(400).json({ error: "Invalid payload" });
         return;
       }
+      const operator = await this.resolveAuthenticatedOperator(req);
 
       const prompt = createRegenerationPrompt({
         supportRequestId: body.support_request_id,
@@ -1059,7 +1180,7 @@ export class SupportPlugin extends Plugin {
           body.order_id,
           body.operator_context ?? null,
           JSON.stringify(normalized),
-          body.actor ?? null,
+          operator,
         ],
       );
 

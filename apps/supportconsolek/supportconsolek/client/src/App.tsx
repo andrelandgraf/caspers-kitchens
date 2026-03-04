@@ -131,7 +131,6 @@ function App() {
   const [selected, setSelected] = useState<RequestDetails | null>(null);
   const [replyText, setReplyText] = useState("");
   const [operatorContext, setOperatorContext] = useState("");
-  const [actor, setActor] = useState("");
   const [refundAmount, setRefundAmount] = useState("");
   const [creditAmount, setCreditAmount] = useState("");
   const [ratingChoice, setRatingChoice] = useState<"thumbs_up" | "thumbs_down">("thumbs_up");
@@ -309,7 +308,6 @@ function App() {
           user_id: selected.user_id,
           action_type: actionType,
           amount_usd: Number(amount),
-          actor: actor || null,
           payload: { source: "appkit-ui" },
         }),
       });
@@ -346,7 +344,6 @@ function App() {
           order_id: selected.order_id,
           user_id: selected.user_id,
           message_text: replyText,
-          sent_by: actor || null,
         }),
       });
       if (!res.ok) {
@@ -381,7 +378,6 @@ function App() {
           support_request_id: selected.support_request_id,
           order_id: selected.order_id,
           user_id: selected.user_id,
-          actor: actor || null,
           operator_context: operatorContext || null,
           current_report: selected.report,
         }),
@@ -424,7 +420,6 @@ function App() {
           rating: ratingChoice,
           reason_code: ratingReason || null,
           feedback_notes: ratingNotes || null,
-          actor: actor || null,
         }),
       });
       if (!res.ok) {
@@ -679,20 +674,17 @@ function App() {
                       onChange={(e) => setReplyText(e.target.value)}
                     />
                   </div>
-                  <div className="grid grid-cols-2 gap-2">
-                    <Input value={actor} placeholder="Operator" onChange={(e) => setActor(e.target.value)} />
-                    <div className="w-fit">
-                      <Button onClick={() => void sendReply()} disabled={detailsLoading || pendingAction !== null}>
-                        {pendingAction === "send_reply" ? (
-                          <span className="inline-flex items-center">
-                            <span className="mr-2 inline-block h-3 w-3 animate-spin rounded-full border-2 border-current border-t-transparent" />
-                            Sending...
-                          </span>
-                        ) : (
-                          "Reply"
-                        )}
-                      </Button>
-                    </div>
+                  <div className="w-fit">
+                    <Button onClick={() => void sendReply()} disabled={detailsLoading || pendingAction !== null}>
+                      {pendingAction === "send_reply" ? (
+                        <span className="inline-flex items-center">
+                          <span className="mr-2 inline-block h-3 w-3 animate-spin rounded-full border-2 border-current border-t-transparent" />
+                          Sending...
+                        </span>
+                      ) : (
+                        "Reply"
+                      )}
+                    </Button>
                   </div>
                   <div className="grid grid-cols-2 gap-2 items-center">
                     <Input

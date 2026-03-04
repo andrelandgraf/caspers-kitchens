@@ -1,7 +1,6 @@
 bundle:
   name: supportconsolek
 
-
 resources:
   apps:
     app:
@@ -17,4 +16,24 @@ resources:
 targets:
   default:
     default: true
+  dev2_operator_auth:
+    resources:
+      apps:
+        app:
+          name: "caspers-supportconsole-dev2"
+          description: "Support console (operator auth feature)"
+          config:
+            env:
+              - name: PGPORT
+                value: "5432"
+              - name: PGDATABASE
+                value: "databricks_postgres"
+              - name: PGSSLMODE
+                value: "require"
+              - name: LAKEBASE_ENDPOINT
+                value: "projects/casperskitchens-support-db/branches/feature-operator-auth/endpoints/feature-operator-auth-rw"
+              - name: DATABRICKS_WAREHOUSE_ID
+                value: "e5ed18828056f3cf"
+              - name: SUPPORT_AGENT_ENDPOINT_NAME
+                value: "caspers_support_agent"
 
